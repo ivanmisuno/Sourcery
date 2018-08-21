@@ -20,11 +20,18 @@ private struct ProcessResult {
     let error: String
 }
 
+private struct ParsedTemplate {
+    /// Paths to source Swift files referred to by `<%- import("") -%>` commands
+    let imports: [Path]
+    /// The immediate code extracted from the template file
+    let code: String
+}
+
 open class SwiftTemplate {
 
     public let sourcePath: Path
     let cachePath: Path?
-    let code: String
+    fileprivate let parsedTemplate: ParsedTemplate
 
     private lazy var buildDir: Path = {
         guard let tempDirURL = NSURL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("SwiftTemplate.build") else { fatalError("Unable to get temporary path") }
@@ -37,22 +44,27 @@ open class SwiftTemplate {
     public init(path: Path, cachePath: Path? = nil) throws {
         self.sourcePath = path
         self.cachePath = cachePath
-        self.code = try SwiftTemplate.parse(sourcePath: path)
+        self.parsedTemplate = try SwiftTemplate.parse(sourcePath: path)
     }
 
     private enum Command {
+        case `import`(Path)
         case output(String)
         case controlFlow(String)
         case outputEncoded(String)
     }
 
-    static func parse(sourcePath: Path) throws -> String {
+    fileprivate static func parse(sourcePath: Path) throws -> ParsedTemplate {
 
         let commands = try SwiftTemplate.parseCommands(in: sourcePath)
 
+        var imports = [Path]()
         var outputFile = [String]()
+
         for command in commands {
             switch command {
+            case let .import(path):
+                imports.append(path)
             case let .output(code):
                 outputFile.append("print(\"\\(" + code + ")\", terminator: \"\");")
             case let .controlFlow(code):
@@ -82,8 +94,11 @@ open class SwiftTemplate {
         }
         """
 
-        return code
+        return ParsedTemplate(imports: imports, code: code)
     }
+
+    private static let regexInclude = try! NSRegularExpression(pattern: "include\\(\"([^\"]*)\"\\)", options: [])
+    private static let regexImport = try! NSRegularExpression(pattern: "import\\(\"([^\"]*)\"\\)", options: [])
 
     private static func parseCommands(in sourcePath: Path, includeStack: [Path] = []) throws -> [Command] {
         let templateContent = try "<%%>" + sourcePath.read()
@@ -128,22 +143,31 @@ open class SwiftTemplate {
             }
 
             if code.trimPrefix("-") {
-                let regex = try? NSRegularExpression(pattern: "include\\(\"([^\"]*)\"\\)", options: [])
-                let match = regex?.firstMatch(in: code, options: [], range: code.bridge().entireRange)
-                guard let includedFile = match.map({ code.bridge().substring(with: $0.range(at: 1)) }) else {
-                    throw "\(sourcePath):\(currentLineNumber()) Error while parsing template. Invalid include tag format '\(code)'"
+
+                var appendSourcePathAndLineNumberToError = true
+                do {
+                    if let includePath = try extractIncludedFilePath(code: code, regex: regexInclude, sourcePath: sourcePath, defaultExtensionIfOmitted: "swifttemplate") {
+                        // Check for include cycles to prevent stack overflow and show a more user friendly error
+                        if includeStack.contains(includePath) {
+                            throw "Include cycle detected for \(includePath). Check your include statements so that templates do not include each other."
+                        }
+
+                        appendSourcePathAndLineNumberToError = false // Don't modify the error if thrown from the recursive call to `parseCommands` - it's already adorned with sourcePath:lineNumber information.
+                        let includedCommands = try SwiftTemplate.parseCommands(in: includePath, includeStack: includeStack + [includePath])
+                        commands.append(contentsOf: includedCommands)
+                    } else if let importPath = try extractIncludedFilePath(code: code, regex: regexImport, sourcePath: sourcePath, defaultExtensionIfOmitted: "swift") {
+                        commands.append(.import(importPath))
+                    } else {
+                        throw "The tag starting with `<%-` must contain either `include(\"\")` or `import(\"\")` command, have: '\(code)'"
+                    }
+                } catch {
+                    if appendSourcePathAndLineNumberToError {
+                        throw "\(sourcePath):\(currentLineNumber()) Error: \(error)"
+                    } else {
+                        throw error
+                    }
                 }
-                var includePath = Path(components: [sourcePath.parent().string, includedFile])
-                // The template extension may be omitted, so try to read again by adding it if a template was not found
-                if !includePath.exists, includePath.extension != "swifttemplate" {
-                    includePath = Path(includePath.string + ".swifttemplate")
-                }
-                // Check for include cycles to prevent stack overflow and show a more user friendly error
-                if includeStack.contains(includePath) {
-                    throw "\(sourcePath):\(currentLineNumber()) Error: Include cycle detected for \(includePath). Check your include statements so that templates do not include each other."
-                }
-                let includedCommands = try SwiftTemplate.parseCommands(in: includePath, includeStack: includeStack + [includePath])
-                commands.append(contentsOf: includedCommands)
+
             } else if code.trimPrefix("=") {
                 commands.append(.output(code))
             } else {
@@ -161,11 +185,27 @@ open class SwiftTemplate {
         return commands
     }
 
+    private static func extractIncludedFilePath(code: String, regex: NSRegularExpression, sourcePath: Path, defaultExtensionIfOmitted: String? = nil) throws -> Path? {
+        guard let match = regex.firstMatch(in: code, options: [], range: code.bridge().entireRange) else {
+            return nil
+        }
+        let includedFile = code.bridge().substring(with: match.range(at: 1))
+        var includePath = Path(components: [sourcePath.parent().string, includedFile])
+        // The template extension may be omitted, so try to read again by adding it if a template was not found
+        if !includePath.exists, let defaultExtensionIfOmitted = defaultExtensionIfOmitted, includePath.extension != defaultExtensionIfOmitted {
+            includePath = Path(includePath.string + ".\(defaultExtensionIfOmitted)")
+        }
+        guard includePath.exists else {
+            throw "File \(includePath) does not exist!"
+        }
+        return includePath
+    }
+
     public func render(_ context: Any) throws -> String {
         let binaryPath: Path
 
         if let cachePath = cachePath,
-            let hash = code.sha256(),
+            let hash = try parsedTemplate.sha256(),
             let hashPath = hash.addingPercentEncoding(withAllowedCharacters: CharacterSet.alphanumerics) {
 
             binaryPath = cachePath + hashPath
@@ -198,9 +238,12 @@ open class SwiftTemplate {
         let binaryFile = buildDir + Path("bin")
 
         try copyFramework(to: buildDir.parent())
-        try mainFile.write(code)
+        try mainFile.write(parsedTemplate.code)
+        let sourceFiles = try copy(importedFiles: parsedTemplate.imports, to: buildDir)
 
-        let arguments = [mainFile.description] +
+        let arguments = [
+            [mainFile.description],
+            sourceFiles.map { $0.description },
             [
                 "-suppress-warnings",
                 "-Onone",
@@ -209,7 +252,8 @@ open class SwiftTemplate {
                 "-F", buildDir.parent().description,
                 "-o", binaryFile.description,
                 "-Xlinker", "-headerpad_max_install_names"
-        ]
+            ]
+        ].flatMap { $0 }
 
         let compilationResult = try Process.runCommand(path: "/usr/bin/swiftc",
                                                        arguments: arguments)
@@ -244,6 +288,14 @@ open class SwiftTemplate {
 
         if !copyFramework.error.isEmpty {
             throw copyFramework.error
+        }
+    }
+
+    private func copy(importedFiles files: [Path], to directory: Path) throws -> [Path] {
+        return try files.map { file in
+            let destinationPath = Path(components: [directory.string, file.lastComponent])
+            try file.copy(destinationPath)
+            return destinationPath
         }
     }
 
@@ -320,3 +372,12 @@ extension String {
     }
 }
 
+extension ParsedTemplate {
+    func sha256() throws -> String? {
+        let importedFilesContents = try imports.reduce(into: "") { (partialResult: inout String, nextFile: Path) in
+            partialResult.append(try nextFile.read())
+        }
+        let concatenatedCodeAndImportedFileContents = code.appending(importedFilesContents)
+        return concatenatedCodeAndImportedFileContents.sha256()
+    }
+}
